@@ -41,7 +41,7 @@ LOCK_BG = "#e0e7ff"
 
 ACTIVE_COLUMNS = [
     "Market", "Signal_ID", "Strategy", "Direction", "Entry", "SL", "TP",
-    "Opened_At", "Opened_Candle_Date", "Status", "Closed_At", "Close_Reason", "Close_Price"
+    "Opened_At", "Opened_Candle_Date", "Status", "Closed_At", "Close_Reason", "Close_Price", "Challenge_Level"
 ]
 LOG_COLUMNS = ["Signal_Key", "Signal_ID", "Timestamp", "Strategy", "Market", "Direction", "Message"]
 
@@ -233,6 +233,149 @@ def add_indicators(df):
     return add_adx(add_atr(add_macd(add_rsi(add_ema(df)))))
 
 
+
+# ============================ CHALLENGE LADDER ============================
+
+CHALLENGE_STATE_COLUMNS = ["Current_Level", "Last_Update", "Last_Result", "Last_Message"]
+
+
+def build_challenge_ladder(start_balance=20.0, levels=30, risk_percent=30.0, target_pips=20, pip_value_per_lot=10.0):
+    """
+    Builds the level pattern from the uploaded image:
+    - TP/profit moves to next level.
+    - SL/loss returns to previous level.
+    - Lot size is based on the current level profit goal and pip target.
+    """
+    rows = []
+    balances = [float(start_balance)]
+
+    for _ in range(1, int(levels)):
+        balances.append(float(round(balances[-1] * (1 + float(risk_percent) / 100.0))))
+
+    for i, balance in enumerate(balances, start=1):
+        previous_balance = balances[i - 2] if i > 1 else np.nan
+        next_balance = balances[i] if i < len(balances) else round(balance * (1 + float(risk_percent) / 100.0))
+
+        risk_amount = np.nan if i == 1 else round(balance - previous_balance, 2)
+        profit_goal = round(next_balance - balance, 2)
+        lot_size = round(profit_goal / (float(target_pips) * float(pip_value_per_lot)), 2)
+
+        rows.append({
+            "Level": i,
+            "Starting_Balance": round(balance, 2),
+            "Percentage_Risk": f"{float(risk_percent):.0f}%",
+            "Risk": "you decide" if i == 1 else risk_amount,
+            "Profit_Goal": profit_goal,
+            "Pips": int(target_pips),
+            "Lot_Size": lot_size,
+            "Balance_If_TP": round(next_balance, 2),
+            "Balance_If_SL": round(previous_balance, 2) if i > 1 else round(balance, 2),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def save_challenge_state(state):
+    df = pd.DataFrame([{
+        "Current_Level": int(state.get("Current_Level", 1)),
+        "Last_Update": state.get("Last_Update", safe_timestamp()),
+        "Last_Result": state.get("Last_Result", ""),
+        "Last_Message": state.get("Last_Message", ""),
+    }])
+    df.to_csv(CHALLENGE_STATE_FILE, index=False)
+
+
+def load_challenge_state():
+    if CHALLENGE_STATE_FILE.exists():
+        try:
+            df = pd.read_csv(CHALLENGE_STATE_FILE)
+            if not df.empty:
+                level = int(pd.to_numeric(df.iloc[-1].get("Current_Level", 1), errors="coerce"))
+                if level < 1:
+                    level = 1
+                return {
+                    "Current_Level": level,
+                    "Last_Update": str(df.iloc[-1].get("Last_Update", "")),
+                    "Last_Result": str(df.iloc[-1].get("Last_Result", "")),
+                    "Last_Message": str(df.iloc[-1].get("Last_Message", "")),
+                }
+        except Exception:
+            pass
+
+    state = {
+        "Current_Level": 1,
+        "Last_Update": safe_timestamp(),
+        "Last_Result": "INIT",
+        "Last_Message": "Challenge initialized at Level 1.",
+    }
+    save_challenge_state(state)
+    return state
+
+
+def reset_challenge_state():
+    state = {
+        "Current_Level": 1,
+        "Last_Update": safe_timestamp(),
+        "Last_Result": "RESET",
+        "Last_Message": "Challenge reset to Level 1.",
+    }
+    save_challenge_state(state)
+    try:
+        clear_active_signal_state()
+    except Exception:
+        pass
+    return state
+
+
+def set_challenge_level(level):
+    level = max(1, int(level))
+    state = {
+        "Current_Level": level,
+        "Last_Update": safe_timestamp(),
+        "Last_Result": "MANUAL_SET",
+        "Last_Message": f"Challenge manually set to Level {level}.",
+    }
+    save_challenge_state(state)
+    return state
+
+
+def get_current_ladder_row(ladder_df):
+    state = load_challenge_state()
+    max_level = int(ladder_df["Level"].max())
+    level = max(1, min(int(state["Current_Level"]), max_level))
+
+    if level != int(state["Current_Level"]):
+        state = set_challenge_level(level)
+
+    row = ladder_df[ladder_df["Level"] == level].iloc[0].to_dict()
+    return state, row
+
+
+def advance_challenge_after_result(result, max_level):
+    state = load_challenge_state()
+    old_level = max(1, int(state["Current_Level"]))
+
+    if result == "TP":
+        new_level = min(old_level + 1, int(max_level))
+        message = f"TP hit at Level {old_level}. Challenge moves to Level {new_level}."
+    elif result == "SL":
+        new_level = max(old_level - 1, 1)
+        message = f"SL hit at Level {old_level}. Challenge reverts to Level {new_level}."
+    else:
+        new_level = old_level
+        message = f"No level change. Result: {result}"
+
+    new_state = {
+        "Current_Level": new_level,
+        "Last_Update": safe_timestamp(),
+        "Last_Result": result,
+        "Last_Message": message,
+    }
+    save_challenge_state(new_state)
+    return message
+
+
+
 # ============================ ACTIVE SIGNAL LOCK ============================
 
 def load_active_signal_state():
@@ -292,7 +435,8 @@ def active_signal_blocks_new_signal(market=None):
 
 def record_active_signal(signal_id, strategy, market, direction, entry, sl, tp, opened_candle_date, challenge_level=1):
     df = load_active_signal_state()
-    rows = df[(df["Market"].astype(str) == str(market)) & (df["Status"].astype(str) == "OPEN")]
+    # Global rule: only one active trade at a time across all pairs.
+    rows = df[df["Status"].astype(str) == "OPEN"]
     if not rows.empty:
         return
     new = pd.DataFrame([{
@@ -358,7 +502,8 @@ def update_open_signal_outcomes(scanner_cache):
             df.loc[idx, "Closed_At"] = safe_timestamp()
             df.loc[idx, "Close_Reason"] = "Take Profit hit" if outcome == "TP" else "Stop Loss hit"
             df.loc[idx, "Close_Price"] = close_price
-            statuses.append(f"{market}: previous {row.get('Direction')} signal closed by {outcome} at {close_price}. New signal allowed.")
+            challenge_msg = advance_challenge_after_result(outcome, max_level=100)
+            statuses.append(f"{market}: previous {row.get('Direction')} signal closed by {outcome} at {close_price}. {challenge_msg}")
             changed = True
     if changed:
         save_active_signal_state(df)
@@ -603,36 +748,90 @@ def scan_markets(markets, scan_speed, target_pips, stop_pips, min_adx, min_atr_p
     return scanner_df, cache, outcomes
 
 
-def send_scanner_telegram_alerts(scanner_df, strategy_name, bot_token, chat_id, enable_telegram, auto_send, target_pips, stop_pips):
+def send_scanner_telegram_alerts(
+    scanner_df,
+    strategy_name,
+    bot_token,
+    chat_id,
+    enable_telegram,
+    auto_send,
+    target_pips,
+    stop_pips,
+    challenge_ladder,
+):
     statuses = []
+    challenge_state, current_step = get_current_ladder_row(challenge_ladder)
+    current_level = int(challenge_state["Current_Level"])
+
     if not enable_telegram or not auto_send or scanner_df is None or scanner_df.empty:
         return statuses
+
     active = scanner_df[scanner_df["Signal"].isin(["BUY", "SELL"])].copy()
+
     for _, row in active.iterrows():
         market, direction = row["Market"], row["Direction"]
         entry, sl, tp = row["Entry"], row["SL"], row["TP"]
         cameroon_time, signal_date = str(row.get("Cameroon_Time", "")), str(row.get("Signal_Date", ""))
+
+        # Global one-trade lock.
         blocked, msg = active_signal_blocks_new_signal(market)
         if blocked:
             statuses.append(f"{market}: {msg}")
             continue
+
         if pd.isna(entry) or pd.isna(sl) or pd.isna(tp):
             statuses.append(f"{market}: Entry/SL/TP missing; skipped.")
             continue
+
         signal_key = make_signal_key(strategy_name, market, direction)
         signal_id = make_signal_id(strategy_name, market, direction, entry, sl, tp, cameroon_time)
+
         if already_sent_exact_signal(signal_id):
             statuses.append(f"{market}: exact same candle signal already sent; skipped.")
             continue
+
         score = row.get("Buy_Confluence", 0) if direction == "BUY" else row.get("Sell_Confluence", 0)
         required = row.get("Required_Confluence", 0)
-        msg_text = format_telegram_signal_message(strategy_name, market, direction, fmt_price(market, entry), fmt_price(market, sl), fmt_price(market, tp), target_pips, stop_pips, f"{int(score)}/{int(required)}", cameroon_time, str(row.get("Reason", "")))
+
+        challenge_details = (
+            f"Level {current_level} | Lot size {float(current_step['Lot_Size']):.2f} | "
+            f"Profit goal ${float(current_step['Profit_Goal']):.2f} | Risk {current_step['Risk']} | "
+            f"{str(row.get('Reason', ''))}"
+        )
+
+        msg_text = format_telegram_signal_message(
+            strategy_name,
+            market,
+            direction,
+            fmt_price(market, entry),
+            fmt_price(market, sl),
+            fmt_price(market, tp),
+            target_pips,
+            stop_pips,
+            f"{int(score)}/{int(required)}",
+            cameroon_time,
+            challenge_details,
+        )
+
         ok, response = send_telegram_message(bot_token, chat_id, msg_text)
+
         if ok:
             save_telegram_sent_signal(signal_key, signal_id, strategy_name, market, direction, response)
-            record_active_signal(signal_id, strategy_name, market, direction, entry, sl, tp, signal_date)
-            statuses.append(f"{market}: signal locked as OPEN until TP or SL is hit.")
+            record_active_signal(
+                signal_id,
+                strategy_name,
+                market,
+                direction,
+                entry,
+                sl,
+                tp,
+                signal_date,
+                challenge_level=current_level,
+            )
+            statuses.append(f"{market}: Level {current_level} signal locked as OPEN until TP or SL is hit.")
+
         statuses.append(f"{market}: {response}")
+
     return statuses
 
 
@@ -685,7 +884,8 @@ with st.sidebar:
     stop_pips = st.number_input("Stop loss in pips", min_value=3, value=10, step=1)
     pip_value_per_lot = st.number_input("Pip value per 1.00 lot", min_value=1.0, value=10.0, step=1.0)
 
-    manual_level = st.number_input("Manual current level", min_value=1, max_value=int(challenge_levels), value=load_challenge_state()["Current_Level"], step=1)
+    loaded_level = max(1, min(int(load_challenge_state()["Current_Level"]), int(challenge_levels)))
+    manual_level = st.number_input("Manual current level", min_value=1, max_value=int(challenge_levels), value=loaded_level, step=1)
     if st.button("Set current challenge level"):
         set_challenge_level(manual_level)
         st.success(f"Challenge level set to {manual_level}.")
@@ -744,14 +944,27 @@ if not scan_markets_selected:
     st.warning("Select at least one pair to scan.")
     st.stop()
 
-projection = challenge_projection(start_balance, target_balance, risk_percent, target_pips, stop_pips)
-if projection:
-    pcols = st.columns(4)
-    pcols[0].metric("Challenge", f"${start_balance:,.0f} → ${target_balance:,.0f}")
-    pcols[1].metric("TP / SL", f"{target_pips} / {stop_pips} pips")
-    pcols[2].metric("Reward-to-risk", f"{projection['RR']:.2f}R")
-    pcols[3].metric("Perfect wins needed", projection["Perfect wins needed"])
-    st.warning("Projection assumes zero losses and perfect compounding. It is not a guarantee and is extremely high risk.")
+challenge_ladder = build_challenge_ladder(
+    start_balance=start_balance,
+    levels=int(challenge_levels),
+    risk_percent=risk_percent,
+    target_pips=target_pips,
+    pip_value_per_lot=pip_value_per_lot,
+)
+
+challenge_state, current_step = get_current_ladder_row(challenge_ladder)
+current_level = int(challenge_state["Current_Level"])
+
+pcols = st.columns(5)
+pcols[0].metric("Current Level", current_level)
+pcols[1].metric("Starting Balance", f"${current_step['Starting_Balance']:,.2f}")
+risk_display = current_step["Risk"] if isinstance(current_step["Risk"], str) else f"${float(current_step['Risk']):,.2f}"
+pcols[2].metric("Risk", risk_display)
+pcols[3].metric("Profit Goal", f"${current_step['Profit_Goal']:,.2f}")
+pcols[4].metric("Lot Size", f"{current_step['Lot_Size']:.2f}")
+
+st.info(challenge_state.get("Last_Message", "Challenge ready."))
+st.caption("Pattern rule: only one active trade. TP moves to the next level. SL reverts to the previous level.")
 
 scanner_df, scanner_cache, outcome_statuses = scan_markets(
     markets=scan_markets_selected,
@@ -773,7 +986,17 @@ scanner_df["Pattern_Lot_Size"] = current_step["Lot_Size"]
 scanner_df["Profit_Goal"] = current_step["Profit_Goal"]
 scanner_df["Pattern_Risk"] = current_step["Risk"]
 
-telegram_statuses = send_scanner_telegram_alerts(scanner_df, STRATEGY_NAME, bot_token, chat_id, enable_telegram, auto_send_telegram, target_pips, stop_pips)
+telegram_statuses = send_scanner_telegram_alerts(
+    scanner_df,
+    STRATEGY_NAME,
+    bot_token,
+    chat_id,
+    enable_telegram,
+    auto_send_telegram,
+    target_pips,
+    stop_pips,
+    challenge_ladder,
+)
 
 if outcome_statuses:
     st.subheader("TP/SL Outcome Updates")
@@ -802,7 +1025,7 @@ open_state = load_active_signal_state()
 open_state = open_state[open_state["Status"].astype(str) == "OPEN"] if not open_state.empty else open_state
 if not open_state.empty:
     st.subheader("Open Signal State")
-    st.caption("A pair remains locked until its TP or SL is hit.")
+    st.caption("Only one active trade is allowed. The system waits for TP or SL before validating a new signal.")
     st.dataframe(open_state, use_container_width=True)
 
 st.divider()
